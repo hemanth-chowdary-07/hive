@@ -15,6 +15,17 @@ import httpx
 logger = logging.getLogger(__name__)
 
 
+class MCPTimeoutError(Exception):
+    """Raised when an MCP tool call times out."""
+
+    def __init__(self, tool_name: str, timeout: float, message: str = None):
+        self.tool_name = tool_name
+        self.timeout = timeout
+        self.error_type = "timeout"
+        self.message = message or f"Tool '{tool_name}' timed out after {timeout} seconds"
+        super().__init__(self.message)
+
+
 @dataclass
 class MCPServerConfig:
     """Configuration for an MCP server connection."""
@@ -34,6 +45,10 @@ class MCPServerConfig:
 
     # Optional metadata
     description: str = ""
+
+    # Timeout configuration (in seconds)
+    tool_timeout: float = 30.0  # Default timeout for tool calls
+    connection_timeout: float = 30.0  # Default timeout for connections
 
 
 @dataclass
@@ -216,8 +231,8 @@ class MCPClient:
             if not loop_started.is_set():
                 raise RuntimeError("Event loop failed to start")
 
-            # Wait for connection to be ready
-            connection_ready.wait(timeout=10)
+            # Wait for connection to be ready (use configurable timeout)
+            connection_ready.wait(timeout=self.config.connection_timeout)
             if connection_error:
                 raise connection_error[0]
 
@@ -230,10 +245,16 @@ class MCPClient:
         if not self.config.url:
             raise ValueError("url is required for HTTP transport")
 
+        # Use configurable connection timeout
         self._http_client = httpx.Client(
             base_url=self.config.url,
             headers=self.config.headers,
-            timeout=30.0,
+            timeout=httpx.Timeout(
+                connect=self.config.connection_timeout,
+                read=self.config.tool_timeout,
+                write=self.config.tool_timeout,
+                pool=self.config.connection_timeout,
+            ),
         )
 
         # Test connection
@@ -342,6 +363,10 @@ class MCPClient:
 
         Returns:
             Tool result
+
+        Raises:
+            MCPTimeoutError: If the tool call times out
+            ValueError: If the tool is unknown
         """
         if not self._connected:
             self.connect()
@@ -355,12 +380,26 @@ class MCPClient:
             return self._call_tool_http(tool_name, arguments)
 
     async def _call_tool_stdio_async(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        """Call tool via STDIO protocol using persistent session."""
+        """Call tool via STDIO protocol using persistent session with timeout protection."""
         if not self._session:
             raise RuntimeError("STDIO session not initialized")
 
-        # Call tool using persistent session
-        result = await self._session.call_tool(tool_name, arguments=arguments)
+        try:
+            # Wrap tool call with timeout protection
+            result = await asyncio.wait_for(
+                self._session.call_tool(tool_name, arguments=arguments),
+                timeout=self.config.tool_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                f"Tool '{tool_name}' timed out after {self.config.tool_timeout}s. "
+                f"Arguments: {arguments}"
+            )
+            raise MCPTimeoutError(
+                tool_name=tool_name,
+                timeout=self.config.tool_timeout,
+                message=f"Tool '{tool_name}' timed out after {self.config.tool_timeout} seconds",
+            )
 
         # Extract content
         if result.content:
@@ -377,7 +416,7 @@ class MCPClient:
         return None
 
     def _call_tool_http(self, tool_name: str, arguments: dict[str, Any]) -> Any:
-        """Call tool via HTTP protocol."""
+        """Call tool via HTTP protocol with timeout protection."""
         if not self._http_client:
             raise RuntimeError("HTTP client not initialized")
 
@@ -401,6 +440,16 @@ class MCPClient:
                 raise RuntimeError(f"Tool execution error: {data['error']}")
 
             return data.get("result", {}).get("content", [])
+        except httpx.TimeoutException as e:
+            logger.error(
+                f"Tool '{tool_name}' timed out after {self.config.tool_timeout}s. "
+                f"Arguments: {arguments}"
+            )
+            raise MCPTimeoutError(
+                tool_name=tool_name,
+                timeout=self.config.tool_timeout,
+                message=f"HTTP tool call '{tool_name}' timed out: {e}",
+            )
         except Exception as e:
             raise RuntimeError(f"Failed to call tool via HTTP: {e}") from e
 
